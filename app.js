@@ -1,5 +1,7 @@
 document.addEventListener('DOMContentLoaded', () => {
     const faceOrder = ['U', 'R', 'F', 'D', 'L', 'B'];
+    const hm10ServiceUuid = 0xFFE0;
+    const hm10CharacteristicUuid = 0xFFE1;
     const colorNames = {
         U: 'White',
         R: 'Red',
@@ -23,16 +25,143 @@ document.addEventListener('DOMContentLoaded', () => {
     const faceSelect = document.getElementById('face-select');
     const statusDisplay = document.getElementById('scan-status');
     const reviewDisplay = document.getElementById('face-review');
+    const faceProgress = document.getElementById('face-progress');
+    const progressHeading = document.getElementById('progress-heading');
+    const cameraPlaceholder = document.getElementById('camera-placeholder');
     const solveButton = document.getElementById('solve-cube');
     const resultDisplay = document.getElementById('result-display');
+    const connectBluetoothButton = document.getElementById('connect-bluetooth');
+    const sendSolutionButton = document.getElementById('send-solution');
+    const bluetoothStatus = document.getElementById('bluetooth-status');
     const rawFaces = Object.fromEntries(faceOrder.map(face => [face, null]));
     const corrections = new Map();
     let cameraStream = null;
     let solverReady = false;
+    let hm10Device = null;
+    let hm10Characteristic = null;
+    let lastSolution = null;
+    let isConnecting = false;
+    let isSending = false;
+    let isSolving = false;
+    let isCapturing = false;
+    const bluetoothSupported = Boolean(navigator.bluetooth);
 
     function setStatus(message, isError) {
         statusDisplay.textContent = message;
         statusDisplay.classList.toggle('error', Boolean(isError));
+    }
+
+    function setBluetoothStatus(message, isError) {
+        bluetoothStatus.textContent = message;
+        bluetoothStatus.classList.toggle('error', Boolean(isError));
+    }
+
+    function updateBluetoothControls() {
+        const connected = Boolean(hm10Device && hm10Device.gatt && hm10Device.gatt.connected);
+        connectBluetoothButton.textContent = connected ? 'Disconnect HM-10' : 'Connect HM-10';
+        connectBluetoothButton.disabled = !bluetoothSupported || isConnecting || isSending;
+        sendSolutionButton.disabled = !connected || !lastSolution || isConnecting || isSending;
+    }
+
+    function updateCaptureControls() {
+        const canCapture = Boolean(cameraStream) && !isCapturing && !isSolving && !isSending;
+        captureButton.disabled = !canCapture;
+    }
+
+    function renderFaceProgress() {
+        const capturedCount = faceOrder.filter(face => rawFaces[face]).length;
+        progressHeading.textContent = `${capturedCount} of 6 captured`;
+        faceProgress.replaceChildren();
+
+        faceOrder.forEach(face => {
+            const step = document.createElement('div');
+            step.className = `face-step${rawFaces[face] ? ' complete' : ''}`;
+            if (!rawFaces[face] && face === faceSelect.value) {
+                step.classList.add('current');
+            }
+            step.textContent = face;
+            step.setAttribute(
+                'aria-label',
+                `${face} face ${rawFaces[face] ? 'captured' : 'not captured'}`
+            );
+            faceProgress.appendChild(step);
+        });
+    }
+
+    function clearSolution() {
+        lastSolution = null;
+        updateBluetoothControls();
+    }
+
+    function handleBluetoothDisconnect() {
+        hm10Characteristic = null;
+        hm10Device = null;
+        updateBluetoothControls();
+        setBluetoothStatus('HM-10 disconnected.', false);
+    }
+
+    async function connectToHm10() {
+        if (!bluetoothSupported) {
+            throw new Error('Web Bluetooth is unavailable. Try a supported browser over HTTPS.');
+        }
+
+        const device = await navigator.bluetooth.requestDevice({
+            filters: [{ services: [hm10ServiceUuid] }]
+        });
+        device.addEventListener('gattserverdisconnected', handleBluetoothDisconnect);
+        try {
+            const server = await device.gatt.connect();
+            const service = await server.getPrimaryService(hm10ServiceUuid);
+            const characteristic = await service.getCharacteristic(hm10CharacteristicUuid);
+            const properties = characteristic.properties;
+            if (!properties.write && !properties.writeWithoutResponse) {
+                throw new Error('The HM-10 characteristic does not support writing.');
+            }
+
+            hm10Device = device;
+            hm10Characteristic = characteristic;
+            updateBluetoothControls();
+            setBluetoothStatus(`Connected to ${device.name || 'HM-10'}.`, false);
+        } catch (error) {
+            if (device.gatt && device.gatt.connected) {
+                device.gatt.disconnect();
+            }
+            throw error;
+        }
+    }
+
+    async function writeHm10Chunk(chunk) {
+        if (!hm10Characteristic || !hm10Device || !hm10Device.gatt.connected) {
+            throw new Error('The HM-10 is not connected.');
+        }
+
+        if (hm10Characteristic.properties.writeWithoutResponse &&
+            typeof hm10Characteristic.writeValueWithoutResponse === 'function') {
+            await hm10Characteristic.writeValueWithoutResponse(chunk);
+        } else if (hm10Characteristic.properties.write &&
+            typeof hm10Characteristic.writeValueWithResponse === 'function') {
+            await hm10Characteristic.writeValueWithResponse(chunk);
+        } else if (typeof hm10Characteristic.writeValue === 'function') {
+            await hm10Characteristic.writeValue(chunk);
+        } else {
+            throw new Error('This browser cannot write to the HM-10 characteristic.');
+        }
+    }
+
+    async function sendSolutionToHm10(solution) {
+        if (!solution) {
+            throw new Error('There is no solution to send.');
+        }
+
+        const bytes = new TextEncoder().encode(`${solution}\n`);
+        const chunkSize = 20;
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+            await writeHm10Chunk(bytes.slice(offset, offset + chunkSize));
+            if (offset + chunkSize < bytes.length) {
+                await new Promise(resolve => setTimeout(resolve, 30));
+            }
+        }
+        return bytes.length;
     }
 
     function updateCaptureLabel() {
@@ -122,16 +251,17 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function renderReview() {
+    function renderReview(preserveStatus) {
         const centers = getCenters();
         const facelets = getFacelets();
         reviewDisplay.replaceChildren();
+        renderFaceProgress();
 
         faceOrder.forEach((face, faceIndex) => {
             const card = document.createElement('section');
             card.className = 'face-card';
             const heading = document.createElement('h3');
-            heading.textContent = `${face} — ${colorNames[face]}${rawFaces[face] ? '' : ' (not scanned)'}`;
+            heading.textContent = `${face} — ${colorNames[face]}`;
             card.appendChild(heading);
 
             const grid = document.createElement('div');
@@ -149,11 +279,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 sticker.title = facelet
                     ? `${colorNames[facelet]} — click to correct`
                     : 'Not detected';
-                sticker.disabled = !rawFaces[face] || stickerIndex === 4;
+                sticker.disabled = isSolving || isSending || !rawFaces[face] || stickerIndex === 4;
                 sticker.addEventListener('click', () => {
                     const current = facelets[(faceIndex * 9) + stickerIndex];
                     const nextIndex = (faceOrder.indexOf(current) + 1) % faceOrder.length;
                     corrections.set(`${face}-${stickerIndex}`, faceOrder[nextIndex]);
+                    clearSolution();
                     resultDisplay.textContent = '';
                     renderReview();
                 });
@@ -176,8 +307,11 @@ document.addEventListener('DOMContentLoaded', () => {
             )
         );
         const balancedCounts = faceOrder.every(face => counts[face] === 9);
-        solveButton.disabled = !solverReady || !allFacesCaptured || !centersDistinct || !balancedCounts;
+        solveButton.disabled = isSolving || isSending || !solverReady || !allFacesCaptured || !centersDistinct || !balancedCounts;
 
+        if (preserveStatus) {
+            return;
+        }
         if (allFacesCaptured && !centersDistinct) {
             setStatus('The six center colors are too similar. Check the lighting and recapture the affected faces.', true);
         } else if (allFacesCaptured && !balancedCounts) {
@@ -244,8 +378,9 @@ document.addEventListener('DOMContentLoaded', () => {
             cameraStream = null;
         }
         videoElement.srcObject = null;
-        captureButton.disabled = true;
+        cameraPlaceholder.classList.remove('hidden');
         startButton.textContent = 'Turn On Camera';
+        updateCaptureControls();
     }
 
     if (typeof Cube !== 'undefined') {
@@ -281,8 +416,9 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             videoElement.srcObject = cameraStream;
             await videoElement.play();
+            cameraPlaceholder.classList.add('hidden');
             updateGridSize();
-            captureButton.disabled = false;
+            updateCaptureControls();
             startButton.textContent = 'Turn Off Camera';
             setStatus('Center one face in the grid, choose its face label, and capture it.', false);
         } catch (error) {
@@ -296,10 +432,71 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    faceSelect.addEventListener('change', updateCaptureLabel);
-    captureButton.addEventListener('click', async () => {
+    connectBluetoothButton.addEventListener('click', async () => {
+        if (isConnecting || isSending) {
+            return;
+        }
+
+        if (hm10Device && hm10Device.gatt && hm10Device.gatt.connected) {
+            hm10Device.gatt.disconnect();
+            return;
+        }
+
+        isConnecting = true;
+        updateBluetoothControls();
+        setBluetoothStatus('Select the HM-10 in the browser Bluetooth prompt...', false);
+        try {
+            await connectToHm10();
+        } catch (error) {
+            console.error('Could not connect to the HM-10:', error);
+            hm10Characteristic = null;
+            hm10Device = null;
+            setBluetoothStatus(`Could not connect: ${error.message}`, true);
+        } finally {
+            isConnecting = false;
+            updateBluetoothControls();
+        }
+    });
+
+    sendSolutionButton.addEventListener('click', async () => {
+        if (!lastSolution || isSending || isSolving) {
+            return;
+        }
+
+        isSending = true;
+        updateBluetoothControls();
+        updateCaptureControls();
+        renderReview(true);
+        setBluetoothStatus('Sending solution to the HM-10...', false);
+        try {
+            const byteCount = await sendSolutionToHm10(lastSolution);
+            setBluetoothStatus(`Sent ${byteCount} bytes to the HM-10.`, false);
+        } catch (error) {
+            console.error('Could not send the solution to the HM-10:', error);
+            setBluetoothStatus(`Send failed: ${error.message}`, true);
+        } finally {
+            isSending = false;
+            updateBluetoothControls();
+            updateCaptureControls();
+            renderReview(true);
+        }
+    });
+
+    faceSelect.addEventListener('change', () => {
+        updateCaptureLabel();
+        renderFaceProgress();
+    });
+
+    async function captureFace() {
+        if (!cameraStream || isCapturing || isSolving || isSending) {
+            return;
+        }
+
         const face = faceSelect.value;
-        captureButton.disabled = true;
+        isCapturing = true;
+        updateCaptureControls();
+        clearSolution();
+        resultDisplay.textContent = '';
         setStatus('Hold the cube steady while the camera samples each sticker...', false);
         try {
             rawFaces[face] = await sampleFrame();
@@ -311,45 +508,73 @@ document.addEventListener('DOMContentLoaded', () => {
                 faceSelect.value = nextFace;
             }
             updateCaptureLabel();
-            resultDisplay.textContent = '';
             renderReview();
+            setStatus(`Captured ${face} face. Review it or continue with the next face.`, false);
         } catch (error) {
             console.error('Error capturing cube face:', error);
             setStatus(error.message, true);
         } finally {
-            captureButton.disabled = !cameraStream;
+            isCapturing = false;
+            updateCaptureControls();
         }
+    }
+
+    captureButton.addEventListener('click', () => {
+        void captureFace();
     });
 
-    solveButton.addEventListener('click', () => {
+    solveButton.addEventListener('click', async () => {
+        if (isSolving || isSending) {
+            return;
+        }
+
+        isSolving = true;
+        updateCaptureControls();
+        solveButton.disabled = true;
+        clearSolution();
         try {
             const facelets = getFacelets();
             if (facelets.length !== 54 || facelets.some(face => !face)) {
                 throw new Error('Scan all six faces and correct any undetected stickers first.');
             }
             const cube = Cube.fromString(facelets.join(''));
-            const solution = cube.solve();
+            const solution = cube.solve().trim();
+            lastSolution = solution || null;
             resultDisplay.textContent = solution
                 ? `Solution (${solution.trim().split(/\s+/).length} moves): ${solution}`
                 : 'The cube is already solved.';
+            updateBluetoothControls();
+            if (lastSolution && hm10Device && hm10Device.gatt && hm10Device.gatt.connected) {
+                isSending = true;
+                updateBluetoothControls();
+                updateCaptureControls();
+                renderReview(true);
+                setBluetoothStatus('Solution generated. Sending it to the HM-10...', false);
+                try {
+                    const byteCount = await sendSolutionToHm10(lastSolution);
+                    setBluetoothStatus(`Sent ${byteCount} bytes to the HM-10.`, false);
+                } catch (error) {
+                    console.error('Could not send the solved moves to the HM-10:', error);
+                    setBluetoothStatus(`Solution generated, but send failed: ${error.message}`, true);
+                } finally {
+                    isSending = false;
+                }
+            } else if (lastSolution) {
+                setBluetoothStatus('Solution ready. Connect the HM-10 to enable sending.', false);
+            } else {
+                setBluetoothStatus('The cube is already solved; there are no moves to send.', false);
+            }
             setStatus('Solution generated from the scanned cube.', false);
         } catch (error) {
             console.error('Error solving scanned cube:', error);
             resultDisplay.textContent = `Could not solve this scan: ${error.message}`;
             setStatus('The scanned colors may not describe a valid cube. Review the face order and stickers.', true);
-        }
-    });
-
-    const testButton = document.getElementById('test-solver');
-    testButton.addEventListener('click', () => {
-        try {
-            const cube = Cube.fromString('UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB');
-            cube.move("R U R' U'");
-            const solution = cube.solve();
-            resultDisplay.textContent = `Sample solution: ${solution}`;
-        } catch (error) {
-            console.error('Error running solver test:', error);
-            resultDisplay.textContent = `Solver test failed: ${error.message}`;
+        } finally {
+            isSolving = false;
+            isSending = false;
+            updateCaptureControls();
+            updateBluetoothControls();
+            renderReview(true);
         }
     });
 
@@ -357,5 +582,9 @@ document.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('resize', updateGridSize);
     videoElement.addEventListener('loadedmetadata', updateGridSize);
     updateCaptureLabel();
+    updateBluetoothControls();
+    if (!bluetoothSupported) {
+        setBluetoothStatus('Web Bluetooth is unavailable in this browser or page context. Use a supported browser over HTTPS.', true);
+    }
     renderReview();
 });
