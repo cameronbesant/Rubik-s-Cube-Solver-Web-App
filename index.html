@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rubik's Cube Scanner</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <h1>Scan Rubik's Cube</h1>
+    <p class="instructions">
+        Turn on the camera, select the face currently facing it, and align all nine
+        stickers inside the grid. Hold the cube with U on top and F toward you, then
+        scan U, R, F, D, L, B. For R/F/L/B, keep the U edge at the top of the grid;
+        for U, put the F edge at the bottom; for D, put the F edge at the top.
+        Review the detected colors before solving.
+    </p>
+
+    <div class="scanner">
+        <div class="video-container">
+            <!-- playsinline is crucial for iOS Safari so it doesn't force full screen -->
+            <video id="camera-feed" autoplay playsinline muted></video>
+            <div class="scan-grid" aria-hidden="true">
+                <span></span><span></span><span></span>
+                <span></span><span></span><span></span>
+                <span></span><span></span><span></span>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="start-camera">Turn On Camera</button>
+        <label for="face-select">Face being scanned</label>
+        <select id="face-select">
+            <option value="U">U — Up</option>
+            <option value="R">R — Right</option>
+            <option value="F">F — Front</option>
+            <option value="D">D — Down</option>
+            <option value="L">L — Left</option>
+            <option value="B">B — Back</option>
+        </select>
+        <button id="capture-face" disabled>Capture U face</button>
+    </div>
+
+    <p id="scan-status" class="status" role="status" aria-live="polite">
+        Turn on the camera to begin scanning.
+    </p>
+
+    <section class="review-section" aria-labelledby="review-heading">
+        <h2 id="review-heading">Detected faces</h2>
+        <p>Click a detected sticker to cycle its color if it was misidentified. Centers are fixed.</p>
+        <div id="face-review" class="face-review"></div>
+        <button id="solve-cube" class="solve-button" disabled>Solve scanned cube</button>
+        <div id="result-display" class="result" aria-live="polite"></div>
+    </section>
+
+    <details class="test-section">
+        <summary>Solver test</summary>
+        <button id="test-solver" class="test-button">Solve a sample cube</button>
+    </details>
+
+    <!-- Include both required parts of cubejs library -->
+    <script src="https://unpkg.com/cubejs@1.3.0/lib/cube.js"></script>
+    <script src="https://unpkg.com/cubejs@1.3.0/lib/solve.js"></script>
+    
+    <!-- Include your app logic last -->
+    <script src="app.js"></script>
+</body>
+</html>
